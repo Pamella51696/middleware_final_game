@@ -27,16 +27,16 @@ public class VideoStreamingServer {
     private static final int TARGET_WIDTH  = 640;
     private static final int OVERLAP_PX    = 72;
     /** Horizontal FOV of each rectified panel. Higher = more zoomed out. */
-    private static final double OUTPUT_FOV_DEG = 104.0;
+    private static final double OUTPUT_FOV_DEG = 128.0;
     /** Keep this fraction of the remapped frame (1.0 = no extra zoom crop). */
-    private static final double CROP_WIDTH_FRACTION = 0.90;
-    private static final double CROP_MAX_HEIGHT_FRACTION = 0.86;
+    private static final double CROP_WIDTH_FRACTION = 0.96;
+    private static final double CROP_MAX_HEIGHT_FRACTION = 0.94;
     /** 0 = keep the top of the remap, 1 = keep the bottom (ground). */
     private static final double CROP_Y_BIAS = 0.50;
     /** Drop rows/cols darker than this after remap (fisheye rim / empty map). */
-    private static final double VALID_LUMA_MIN = 18.0;
+    private static final double VALID_LUMA_MIN = 14.0;
     /** Extra inset of the valid region so the curved fisheye rim is not stretched. */
-    private static final double VALID_INSET_FRACTION = 0.04;
+    private static final double VALID_INSET_FRACTION = 0.015;
     /** Horizon row in the shared output frame (fraction of height from the top). */
     private static final double HORIZON_FRACTION = 0.40;
     /** Last stitch panel — rear camera (bumper at bottom of raw fisheye). */
@@ -461,12 +461,11 @@ public class VideoStreamingServer {
         Mat mask = new Mat();
         Imgproc.threshold(gray, mask, VALID_LUMA_MIN, 255, Imgproc.THRESH_BINARY);
 
-        int k = Math.max(11, Math.min(imgW, imgH) / 28);
+        int k = Math.max(7, Math.min(imgW, imgH) / 48);
         if ((k & 1) == 0) {
             k++;
         }
         Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, new Size(k, k));
-        Imgproc.erode(mask, mask, kernel);
         Imgproc.erode(mask, mask, kernel);
 
         Rect box = Imgproc.boundingRect(mask);
