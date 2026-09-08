@@ -25,18 +25,21 @@ public class VideoStreamingServer {
     private static final int DEFAULT_PORT  = 9090;
     private static final int TARGET_HEIGHT = 360;
     private static final int TARGET_WIDTH  = 640;
-    private static final int OVERLAP_PX    = 56;
+    /** Horizontal seam overlap for feather blending. */
+    private static final int OVERLAP_PX    = 96;
+    /** Extra black band above/below the staggered panels. */
+    private static final int CANVAS_PAD_Y  = 16;
     /** Horizontal FOV of each rectified panel (cylindrical). Higher = more zoomed out. */
-    private static final double OUTPUT_FOV_DEG = 128.0;
+    private static final double OUTPUT_FOV_DEG = 152.0;
     /** Keep this fraction of the remapped frame (1.0 = no extra zoom crop). */
-    private static final double CROP_WIDTH_FRACTION = 0.96;
-    private static final double CROP_MAX_HEIGHT_FRACTION = 0.94;
+    private static final double CROP_WIDTH_FRACTION = 1.00;
+    private static final double CROP_MAX_HEIGHT_FRACTION = 0.98;
     /** 0 = keep the top of the remap, 1 = keep the bottom (ground). */
     private static final double CROP_Y_BIAS = 0.50;
     /** Drop rows/cols darker than this after remap (fisheye rim / empty map). */
     private static final double VALID_LUMA_MIN = 14.0;
     /** Extra inset of the valid region so the curved fisheye rim is not stretched. */
-    private static final double VALID_INSET_FRACTION = 0.015;
+    private static final double VALID_INSET_FRACTION = 0.006;
     /** Horizon row in the shared output frame (fraction of height from the top). */
     private static final double HORIZON_FRACTION = 0.40;
     /** Last stitch panel — rear camera (bumper at bottom of raw fisheye). */
@@ -152,7 +155,12 @@ public class VideoStreamingServer {
               continue;
             }
 
-            Mat panorama = featherStitch(ready);
+            int[] horizons = new int[ready.length];
+            for (int i = 0; i < ready.length; i++) {
+              horizons[i] = undistort[i].horizonRow();
+            }
+
+            Mat panorama = featherStitch(ready, horizons);
             writeFrame(out, encodeJpeg(panorama));
             panorama.release();
           }
@@ -207,6 +215,8 @@ public class VideoStreamingServer {
 
     interface CameraFeedFilter {
         void recalibrateAndFilter(Mat src, Mat dst360x640);
+        /** Horizon row in the filtered TARGET-sized panel (pixels from the top). */
+        int horizonRow();
     }
 
     /**
@@ -234,8 +244,8 @@ public class VideoStreamingServer {
     //  UNIFIED FISHEYE PANEL
     //
     //  Every feed is remapped with the same output size and FOV, then cropped
-    //  to a filled rectangle (drops circular vignette). A small vertical crop
-    //  nudge lines the horizons up; panels stay upright rectangles.
+    //  to a filled upright rectangle. Vertical placement on a taller black
+    //  canvas locks all four horizons onto one shared row.
 
     static final class FisheyePanelFilter implements CameraFeedFilter {
 
@@ -248,6 +258,7 @@ public class VideoStreamingServer {
         private Mat map2;
         private Mat undistorted;
         private Rect workCrop;
+        private int horizonRow = -1;
         private int cachedSrcW = -1;
         private int cachedSrcH = -1;
 
@@ -283,13 +294,26 @@ public class VideoStreamingServer {
                     Core.BORDER_CONSTANT);
 
             if (workCrop == null) {
-                workCrop = horizonLockedCrop(undistorted);
+                workCrop = cropWindow(undistorted);
             }
             Mat workRoi = undistorted.submat(workCrop);
             Imgproc.resize(workRoi, dst360x640, new Size(TARGET_WIDTH, TARGET_HEIGHT),
                     0, 0, Imgproc.INTER_AREA);
             workRoi.release();
             forceExactSize(dst360x640);
+
+            if (horizonRow < 0) {
+                horizonRow = estimateHorizonRow(dst360x640);
+                horizonRow = Math.max(1, Math.min(TARGET_HEIGHT - 2, horizonRow));
+            }
+        }
+
+        @Override
+        public int horizonRow() {
+            if (horizonRow < 0) {
+                return (int) Math.round(HORIZON_FRACTION * TARGET_HEIGHT);
+            }
+            return horizonRow;
         }
 
         private void ensureMaps(int srcW, int srcH) {
@@ -313,6 +337,7 @@ public class VideoStreamingServer {
             cachedSrcW = srcW;
             cachedSrcH = srcH;
             workCrop = null;
+            horizonRow = -1;
 
             K.release();
             D.release();
@@ -468,34 +493,6 @@ public class VideoStreamingServer {
         return new Rect(x, y, cropW, cropH);
     }
 
-    /**
-     * Same filled 16:9 window as {@link #cropWindow}, then a small vertical
-     * nudge so the estimated horizon sits near HORIZON_FRACTION. No rotation:
-     * each panel stays an upright rectangle.
-     */
-    static Rect horizonLockedCrop(Mat src) {
-        Rect crop = cropWindow(src);
-        Mat preview = new Mat();
-        Mat roi = src.submat(crop);
-        Imgproc.resize(roi, preview, new Size(TARGET_WIDTH, TARGET_HEIGHT),
-                0, 0, Imgproc.INTER_AREA);
-        roi.release();
-
-        int horizon = estimateHorizonRow(preview);
-        preview.release();
-
-        int targetY = (int) Math.round(HORIZON_FRACTION * TARGET_HEIGHT);
-        double dyPanel = targetY - horizon;
-        int dyWork = (int) Math.round(dyPanel * ((double) crop.height / TARGET_HEIGHT));
-        int maxShift = (int) Math.round(crop.height * 0.12);
-        if (dyWork > maxShift) dyWork = maxShift;
-        if (dyWork < -maxShift) dyWork = -maxShift;
-
-        int y = crop.y - dyWork;
-        y = Math.max(0, Math.min(y, src.rows() - crop.height));
-        return new Rect(crop.x, y, crop.width, crop.height);
-    }
-
     /** Filled pixels only, inset so the circular fisheye rim is not stretched. */
     static Rect validPixelRect(Mat bgr) {
         int imgW = bgr.cols();
@@ -584,9 +581,19 @@ public class VideoStreamingServer {
 
 
     //  CORE BLENDING  —  featherStitch
-    //  Upright rectangular panels, feather-blended into one strip.
+    //  Upright rectangular panels on a shared horizon line. Each feed is
+    //  shifted up/down so estimated horizons coincide; leftover bands stay
+    //  black. Overlapping columns are feather-blended.
 
     static Mat featherStitch(Mat[] frames) {
+        int[] horizons = new int[frames.length];
+        for (int i = 0; i < frames.length; i++) {
+            horizons[i] = (int) Math.round(HORIZON_FRACTION * TARGET_HEIGHT);
+        }
+        return featherStitch(frames, horizons);
+    }
+
+    static Mat featherStitch(Mat[] frames, int[] horizons) {
         int N = frames.length;
         int H = TARGET_HEIGHT;
         int W = TARGET_WIDTH;
@@ -594,12 +601,29 @@ public class VideoStreamingServer {
         int overlap = Math.min(OVERLAP_PX, W / 4);
         int panoW   = W + (N - 1) * (W - overlap);
 
-        Mat accumColor  = Mat.zeros(H, panoW, CvType.CV_32FC3);
-        Mat accumWeight = Mat.zeros(H, panoW, CvType.CV_32FC1);
+        int minHor = H;
+        int maxHor = 0;
+        int[] hor = new int[N];
+        for (int i = 0; i < N; i++) {
+            int h = (horizons != null && i < horizons.length) ? horizons[i]
+                    : (int) Math.round(HORIZON_FRACTION * H);
+            if (h < 1) h = 1;
+            if (h > H - 2) h = H - 2;
+            hor[i] = h;
+            minHor = Math.min(minHor, h);
+            maxHor = Math.max(maxHor, h);
+        }
+        int pad = Math.max(0, CANVAS_PAD_Y);
+        int panoH = H + (maxHor - minHor) + 2 * pad;
+        int commonHorizonY = maxHor + pad;
+
+        Mat accumColor  = Mat.zeros(panoH, panoW, CvType.CV_32FC3);
+        Mat accumWeight = Mat.zeros(panoH, panoW, CvType.CV_32FC1);
 
         for (int i = 0; i < N; i++) {
             forceExactSize(frames[i]);
             int xStart = i * (W - overlap);
+            int yStart = commonHorizonY - hor[i];
 
             Mat weight = buildFeatherMask(H, W, overlap, i > 0, i < N - 1);
 
@@ -614,14 +638,31 @@ public class VideoStreamingServer {
             Mat wFrame = new Mat();
             Core.multiply(frameF, weight3, wFrame);
 
-            int xEnd    = Math.min(xStart + W, panoW);
+            int srcX = 0;
+            int srcY = 0;
+            if (xStart < 0) {
+                srcX = -xStart;
+                xStart = 0;
+            }
+            if (yStart < 0) {
+                srcY = -yStart;
+                yStart = 0;
+            }
+            int xEnd = Math.min(xStart + (W - srcX), panoW);
+            int yEnd = Math.min(yStart + (H - srcY), panoH);
             int wActual = xEnd - xStart;
+            int hActual = yEnd - yStart;
+            if (wActual <= 0 || hActual <= 0) {
+                frameF.release(); weight.release(); weight3.release();
+                wFrame.release();
+                continue;
+            }
 
-            Mat colorRoi  = accumColor.submat(0, H, xStart, xEnd);
-            Mat weightRoi = accumWeight.submat(0, H, xStart, xEnd);
+            Mat colorRoi  = accumColor.submat(yStart, yEnd, xStart, xEnd);
+            Mat weightRoi = accumWeight.submat(yStart, yEnd, xStart, xEnd);
 
-            Mat wFrameCrop = wFrame.colRange(0, wActual);
-            Mat weightCrop = weight.colRange(0, wActual);
+            Mat wFrameCrop = wFrame.rowRange(srcY, srcY + hActual).colRange(srcX, srcX + wActual);
+            Mat weightCrop = weight.rowRange(srcY, srcY + hActual).colRange(srcX, srcX + wActual);
 
             Core.add(colorRoi,  wFrameCrop, colorRoi);
             Core.add(weightRoi, weightCrop, weightRoi);
