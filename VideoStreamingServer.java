@@ -26,8 +26,6 @@ public class VideoStreamingServer {
     private static final int TARGET_HEIGHT = 360;
     private static final int TARGET_WIDTH  = 640;
     private static final int OVERLAP_PX    = 56;
-    /** Canvas aspect for the stitched strip (black letterbox above/below). */
-    private static final double OUTPUT_ASPECT = 16.0 / 9.0;
     /** Horizontal FOV of each rectified panel (cylindrical). Higher = more zoomed out. */
     private static final double OUTPUT_FOV_DEG = 128.0;
     /** Keep this fraction of the remapped frame (1.0 = no extra zoom crop). */
@@ -209,8 +207,6 @@ public class VideoStreamingServer {
 
     interface CameraFeedFilter {
         void recalibrateAndFilter(Mat src, Mat dst360x640);
-        /** Horizon row in the filtered TARGET-sized panel (pixels from the top). */
-        int horizonRow();
     }
 
     /**
@@ -238,8 +234,8 @@ public class VideoStreamingServer {
     //  UNIFIED FISHEYE PANEL
     //
     //  Every feed is remapped with the same output size and FOV, then cropped
-    //  to the filled rectangle (drops circular vignette). Each panel is then
-    //  shifted so its horizon sits on one shared row before the stitch.
+    //  to a filled rectangle (drops circular vignette). A small vertical crop
+    //  nudge lines the horizons up; panels stay upright rectangles.
 
     static final class FisheyePanelFilter implements CameraFeedFilter {
 
@@ -251,11 +247,7 @@ public class VideoStreamingServer {
         private Mat map1;
         private Mat map2;
         private Mat undistorted;
-        private Mat cropped;
-        private Mat aligned;
-        private Mat affine;
         private Rect workCrop;
-        private int horizonRow = -1;
         private int cachedSrcW = -1;
         private int cachedSrcH = -1;
 
@@ -286,57 +278,18 @@ public class VideoStreamingServer {
             ensureMaps(src.cols(), src.rows());
 
             if (undistorted == null) undistorted = new Mat();
-            if (cropped == null)     cropped     = new Mat();
-            if (aligned == null)     aligned     = new Mat();
 
             Imgproc.remap(src, undistorted, map1, map2, Imgproc.INTER_LINEAR,
                     Core.BORDER_CONSTANT);
 
             if (workCrop == null) {
-                workCrop = cropWindow(undistorted);
+                workCrop = horizonLockedCrop(undistorted);
             }
             Mat workRoi = undistorted.submat(workCrop);
-            Imgproc.resize(workRoi, cropped, new Size(TARGET_WIDTH, TARGET_HEIGHT),
+            Imgproc.resize(workRoi, dst360x640, new Size(TARGET_WIDTH, TARGET_HEIGHT),
                     0, 0, Imgproc.INTER_AREA);
             workRoi.release();
-
-            if (affine == null) {
-                learnHorizonLock(cropped);
-            }
-
-            Imgproc.warpAffine(cropped, aligned, affine,
-                    new Size(TARGET_WIDTH, TARGET_HEIGHT),
-                    Imgproc.INTER_LINEAR, Core.BORDER_CONSTANT);
-
-            aligned.copyTo(dst360x640);
             forceExactSize(dst360x640);
-        }
-
-        @Override
-        public int horizonRow() {
-            if (horizonRow < 0) {
-                return (int) Math.round(HORIZON_FRACTION * TARGET_HEIGHT);
-            }
-            return horizonRow;
-        }
-
-        /**
-         * Rotate out small roll and shift the panel so its horizon sits on
-         * the shared row. Empty pixels from the shift stay black.
-         */
-        private void learnHorizonLock(Mat panel) {
-            double roll = estimateRollDeg(panel);
-            if (Math.abs(roll) > 8.0) {
-                roll = Math.copySign(8.0, roll);
-            }
-            int horizon = estimateHorizonRow(panel);
-            int targetY = (int) Math.round(HORIZON_FRACTION * TARGET_HEIGHT);
-            double dy = targetY - horizon;
-
-            Point center = new Point(TARGET_WIDTH / 2.0, TARGET_HEIGHT / 2.0);
-            affine = Imgproc.getRotationMatrix2D(center, roll, 1.0);
-            affine.put(1, 2, affine.get(1, 2)[0] + dy);
-            horizonRow = targetY;
         }
 
         private void ensureMaps(int srcW, int srcH) {
@@ -359,9 +312,7 @@ public class VideoStreamingServer {
 
             cachedSrcW = srcW;
             cachedSrcH = srcH;
-            affine = null;
             workCrop = null;
-            horizonRow = -1;
 
             K.release();
             D.release();
@@ -517,6 +468,34 @@ public class VideoStreamingServer {
         return new Rect(x, y, cropW, cropH);
     }
 
+    /**
+     * Same filled 16:9 window as {@link #cropWindow}, then a small vertical
+     * nudge so the estimated horizon sits near HORIZON_FRACTION. No rotation:
+     * each panel stays an upright rectangle.
+     */
+    static Rect horizonLockedCrop(Mat src) {
+        Rect crop = cropWindow(src);
+        Mat preview = new Mat();
+        Mat roi = src.submat(crop);
+        Imgproc.resize(roi, preview, new Size(TARGET_WIDTH, TARGET_HEIGHT),
+                0, 0, Imgproc.INTER_AREA);
+        roi.release();
+
+        int horizon = estimateHorizonRow(preview);
+        preview.release();
+
+        int targetY = (int) Math.round(HORIZON_FRACTION * TARGET_HEIGHT);
+        double dyPanel = targetY - horizon;
+        int dyWork = (int) Math.round(dyPanel * ((double) crop.height / TARGET_HEIGHT));
+        int maxShift = (int) Math.round(crop.height * 0.12);
+        if (dyWork > maxShift) dyWork = maxShift;
+        if (dyWork < -maxShift) dyWork = -maxShift;
+
+        int y = crop.y - dyWork;
+        y = Math.max(0, Math.min(y, src.rows() - crop.height));
+        return new Rect(crop.x, y, crop.width, crop.height);
+    }
+
     /** Filled pixels only, inset so the circular fisheye rim is not stretched. */
     static Rect validPixelRect(Mat bgr) {
         int imgW = bgr.cols();
@@ -593,32 +572,6 @@ public class VideoStreamingServer {
         return bestY;
     }
 
-    static double estimateRollDeg(Mat bgr) {
-        Mat gray = new Mat();
-        Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
-        Imgproc.Canny(gray, gray, 55, 150);
-        Mat lines = new Mat();
-        Imgproc.HoughLinesP(gray, lines, 1, Math.PI / 180.0, 55, 48, 12);
-        ArrayList<Double> angles = new ArrayList<>();
-        for (int i = 0; i < lines.rows(); i++) {
-            double[] l = lines.get(i, 0);
-            if (l == null || l.length < 4) continue;
-            double ang = Math.toDegrees(Math.atan2(l[3] - l[1], l[2] - l[0]));
-            while (ang > 90)  ang -= 180;
-            while (ang < -90) ang += 180;
-            if (Math.abs(ang) <= 22) {
-                angles.add(ang);
-            }
-        }
-        gray.release();
-        lines.release();
-        if (angles.size() < 4) {
-            return 0.0;
-        }
-        java.util.Collections.sort(angles);
-        return angles.get(angles.size() / 2);
-    }
-
     static void forceExactSize(Mat img) {
         if (img.cols() == TARGET_WIDTH && img.rows() == TARGET_HEIGHT) {
             return;
@@ -631,8 +584,7 @@ public class VideoStreamingServer {
 
 
     //  CORE BLENDING  —  featherStitch
-    //  One horizontal strip: feather-blend the four horizon-locked panels,
-    //  then letterbox onto a 16:9 black canvas (bars above and below).
+    //  Upright rectangular panels, feather-blended into one strip.
 
     static Mat featherStitch(Mat[] frames) {
         int N = frames.length;
@@ -696,22 +648,7 @@ public class VideoStreamingServer {
         accumColor.release(); accumWeight.release();
         safeW.release(); safeW3.release(); blended.release();
 
-        Mat letterboxed = letterboxStrip(result);
-        result.release();
-        return letterboxed;
-    }
-
-    /** Center the stitched strip on a black 16:9 canvas. */
-    static Mat letterboxStrip(Mat strip) {
-        int w = strip.cols();
-        int h = strip.rows();
-        int outH = Math.max(h, (int) Math.round(w / OUTPUT_ASPECT));
-        Mat canvas = Mat.zeros(outH, w, strip.type());
-        int y = (outH - h) / 2;
-        Mat roi = canvas.submat(y, y + h, 0, w);
-        strip.copyTo(roi);
-        roi.release();
-        return canvas;
+        return result;
     }
 
     static Mat buildFeatherMask(int H, int W, int overlap, boolean fadeLeft, boolean fadeRight) {
