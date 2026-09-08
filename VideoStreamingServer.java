@@ -25,8 +25,8 @@ public class VideoStreamingServer {
     private static final int DEFAULT_PORT  = 9090;
     private static final int TARGET_HEIGHT = 360;
     private static final int TARGET_WIDTH  = 640;
-    private static final int OVERLAP_PX    = 72;
-    /** Horizontal FOV of each rectified panel. Higher = more zoomed out. */
+    private static final int OVERLAP_PX    = 56;
+    /** Horizontal FOV of each rectified panel (cylindrical). Higher = more zoomed out. */
     private static final double OUTPUT_FOV_DEG = 128.0;
     /** Keep this fraction of the remapped frame (1.0 = no extra zoom crop). */
     private static final double CROP_WIDTH_FRACTION = 0.96;
@@ -41,6 +41,12 @@ public class VideoStreamingServer {
     private static final double HORIZON_FRACTION = 0.40;
     /** Last stitch panel — rear camera (bumper at bottom of raw fisheye). */
     private static final int REAR_CAMERA_INDEX = 3;
+    /**
+     * Yaw of the right (index 2) and rear (index 3) panels toward their shared
+     * seam. If the yellow van splits instead of merging, flip both signs.
+     */
+    private static final double RIGHT_SEAM_YAW_DEG = -6.0;
+    private static final double REAR_SEAM_YAW_DEG  = 10.0;
 
     // =========================================================================
     public static void main(String[] args) throws IOException {
@@ -250,9 +256,15 @@ public class VideoStreamingServer {
         private int cachedSrcH = -1;
 
         static FisheyePanelFilter forStitchIndex(int index) {
-            final double inFov  = 160.0;
+            final double inFov = 160.0;
+            // Same pitch on every panel so objects keep the same height at seams.
+            // Rear yaw swings the left edge toward the right-camera panel (index 2)
+            // so the yellow van can occupy the overlap instead of two different scales.
             if (index == REAR_CAMERA_INDEX) {
-                return new FisheyePanelFilter(new PanelPose(-12.0, 0.0, 0.0, inFov, OUTPUT_FOV_DEG));
+                return new FisheyePanelFilter(new PanelPose(-6.0, REAR_SEAM_YAW_DEG, 0.0, inFov, OUTPUT_FOV_DEG));
+            }
+            if (index == REAR_CAMERA_INDEX - 1) {
+                return new FisheyePanelFilter(new PanelPose(-6.0, RIGHT_SEAM_YAW_DEG, 0.0, inFov, OUTPUT_FOV_DEG));
             }
             return new FisheyePanelFilter(new PanelPose(-6.0, 0.0, 0.0, inFov, OUTPUT_FOV_DEG));
         }
@@ -326,19 +338,18 @@ public class VideoStreamingServer {
                 return;
             }
 
-            Size dstSize = new Size(WORK_WIDTH, WORK_HEIGHT);
-
             Mat K = equidistantK(srcW, srcH, pose.inputFovDeg);
             Mat D = distortionCoeffs();
             Mat R = eulerRyxz(pose.pitchDeg, pose.yawDeg, pose.rollDeg);
-            Mat P = pinholeK(WORK_WIDTH, WORK_HEIGHT, pose.outputFovDeg);
-            P.put(1, 2, HORIZON_FRACTION * WORK_HEIGHT);
 
             if (map1 == null) map1 = new Mat();
             if (map2 == null) map2 = new Mat();
 
-            Calib3d.fisheye_initUndistortRectifyMap(
-                    K, D, R, P, dstSize, CvType.CV_16SC2, map1, map2);
+            // Cylindrical unwarp: azimuth is linear in pixels, so cars at the
+            // panel edge (yellow van on the last feed) are not tan-stretched.
+            buildCylindricalFisheyeMaps(K, D, R, srcW, srcH,
+                    WORK_WIDTH, WORK_HEIGHT, pose.outputFovDeg, HORIZON_FRACTION,
+                    map1, map2);
 
             cachedSrcW = srcW;
             cachedSrcH = srcH;
@@ -349,18 +360,11 @@ public class VideoStreamingServer {
             K.release();
             D.release();
             R.release();
-            P.release();
         }
 
         static Mat equidistantK(int width, int height, double fovDeg) {
             double half = Math.toRadians(fovDeg) / 2.0;
             double f = (Math.min(width, height) / 2.0) / half;
-            return matrixK(f, f, width / 2.0, height / 2.0);
-        }
-
-        static Mat pinholeK(int width, int height, double fovDeg) {
-            double half = Math.toRadians(fovDeg) / 2.0;
-            double f = (width / 2.0) / Math.tan(half);
             return matrixK(f, f, width / 2.0, height / 2.0);
         }
 
@@ -391,6 +395,87 @@ public class VideoStreamingServer {
             Calib3d.Rodrigues(rvec, R);
             rvec.release();
             return R;
+        }
+
+        /**
+         * Map a cylindrical panorama strip back into the fisheye. Horizontal
+         * position is angle (not tan), which keeps a van at the edge of the
+         * last panel closer to the same width as in the neighboring panel.
+         */
+        static void buildCylindricalFisheyeMaps(
+                Mat K, Mat D, Mat R,
+                int srcW, int srcH, int dstW, int dstH,
+                double outputFovDeg, double horizonFraction,
+                Mat map1, Mat map2) {
+
+            double fx = K.get(0, 0)[0];
+            double fy = K.get(1, 1)[0];
+            double cx = K.get(0, 2)[0];
+            double cy = K.get(1, 2)[0];
+            double k1 = D.get(0, 0)[0];
+            double k2 = D.get(1, 0)[0];
+            double k3 = D.get(2, 0)[0];
+            double k4 = D.get(3, 0)[0];
+
+            Mat Rinv = new Mat();
+            Core.invert(R, Rinv);
+            double r00 = Rinv.get(0, 0)[0], r01 = Rinv.get(0, 1)[0], r02 = Rinv.get(0, 2)[0];
+            double r10 = Rinv.get(1, 0)[0], r11 = Rinv.get(1, 1)[0], r12 = Rinv.get(1, 2)[0];
+            double r20 = Rinv.get(2, 0)[0], r21 = Rinv.get(2, 1)[0], r22 = Rinv.get(2, 2)[0];
+            Rinv.release();
+
+            double half = Math.toRadians(outputFovDeg) / 2.0;
+            double fCyl = (dstW / 2.0) / half;
+            double cyOut = horizonFraction * dstH;
+
+            Mat mapX = new Mat(dstH, dstW, CvType.CV_32FC1);
+            Mat mapY = new Mat(dstH, dstW, CvType.CV_32FC1);
+            float[] rowX = new float[dstW];
+            float[] rowY = new float[dstW];
+
+            for (int v = 0; v < dstH; v++) {
+                double yc = (v - cyOut) / fCyl;
+                for (int u = 0; u < dstW; u++) {
+                    double theta = (u - dstW * 0.5) / fCyl;
+                    double xv = Math.sin(theta);
+                    double yv = yc;
+                    double zv = Math.cos(theta);
+
+                    double x = r00 * xv + r01 * yv + r02 * zv;
+                    double y = r10 * xv + r11 * yv + r12 * zv;
+                    double z = r20 * xv + r21 * yv + r22 * zv;
+
+                    if (z <= 1e-6) {
+                        rowX[u] = -1f;
+                        rowY[u] = -1f;
+                        continue;
+                    }
+
+                    double a = x / z;
+                    double b = y / z;
+                    double rho = Math.hypot(a, b);
+                    double th = Math.atan(rho);
+                    double th2 = th * th;
+                    double th4 = th2 * th2;
+                    double thd = th * (1.0 + k1 * th2 + k2 * th4 + k3 * th4 * th2 + k4 * th4 * th4);
+                    double scale = (rho > 1e-8) ? (thd / rho) : 1.0;
+                    double su = fx * scale * a + cx;
+                    double sv = fy * scale * b + cy;
+                    if (su < -1 || sv < -1 || su > srcW || sv > srcH) {
+                        rowX[u] = -1f;
+                        rowY[u] = -1f;
+                    } else {
+                        rowX[u] = (float) su;
+                        rowY[u] = (float) sv;
+                    }
+                }
+                mapX.put(v, 0, rowX);
+                mapY.put(v, 0, rowY);
+            }
+
+            Imgproc.convertMaps(mapX, mapY, map1, map2, CvType.CV_16SC2);
+            mapX.release();
+            mapY.release();
         }
     }
 
