@@ -51,13 +51,13 @@ public class VideoStreamingServer {
         Path backVideo  = ensureDecodable(Paths.get("rear_1.mp4"));
 
         if (args.length >= 5) {
-            frontVideo = ensureDecodable(Paths.get(args[1]));
-            rearVideo  = ensureDecodable(Paths.get(args[2]));
-            sideVideo  = ensureDecodable(Paths.get(args[3]));
+            leftVideo  = ensureDecodable(Paths.get(args[1]));
+            frontVideo = ensureDecodable(Paths.get(args[2]));
+            rightVideo = ensureDecodable(Paths.get(args[3]));
             backVideo  = ensureDecodable(Paths.get(args[4]));
         }
 
-        Path[] videos = {  leftVideo,frontVideo, rightVideo, backVideo };
+        Path[] videos = { leftVideo, frontVideo, rightVideo, backVideo };
 
         for (Path v : videos) {
             if (!Files.exists(v) || Files.isDirectory(v)) {
@@ -85,8 +85,8 @@ public class VideoStreamingServer {
         server.start();
 
         System.out.println("Server started  ->  http://localhost:" + port + "/play");
-        System.out.println("Feeds: front=" + frontVideo + " rear=" + rearVideo
-                + " side=" + sideVideo + " back=" + backVideo);
+        System.out.println("Feeds: left=" + leftVideo + " front=" + frontVideo
+                + " right=" + rightVideo + " rear=" + backVideo);
     }
 
     // STITCH HANDLER  -  undistort each feed, then feather-blend panorama
