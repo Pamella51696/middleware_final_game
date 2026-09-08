@@ -41,10 +41,10 @@ public class VideoStreamingServer {
     // =========================================================================
     public static void main(String[] args) throws IOException {
 
-        Path frontVideo = ensureDecodable(Paths.get("rear_1.mov"));
-        Path rearVideo  = ensureDecodable(Paths.get("left_1.mov"));
-        Path sideVideo  = ensureDecodable(Paths.get("right_1.mov"));
-        Path backVideo  = ensureDecodable(Paths.get("front_1.mov"));
+        Path leftVideo  = ensureDecodable(Paths.get("left_1.mp4"));
+        Path frontVideo = ensureDecodable(Paths.get("front_1.mp4"));
+        Path rightVideo = ensureDecodable(Paths.get("right_1.mp4"));
+        Path backVideo  = ensureDecodable(Paths.get("rear_1.mp4"));
 
         if (args.length >= 5) {
             frontVideo = ensureDecodable(Paths.get(args[1]));
@@ -53,7 +53,7 @@ public class VideoStreamingServer {
             backVideo  = ensureDecodable(Paths.get(args[4]));
         }
 
-        Path[] videos = { frontVideo, rearVideo, sideVideo, backVideo };
+        Path[] videos = {  leftVideo,frontVideo, rightVideo, backVideo };
 
         for (Path v : videos) {
             if (!Files.exists(v) || Files.isDirectory(v)) {
