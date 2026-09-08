@@ -29,10 +29,14 @@ public class VideoStreamingServer {
     /** Horizontal FOV of each rectified panel. Higher = more zoomed out. */
     private static final double OUTPUT_FOV_DEG = 104.0;
     /** Keep this fraction of the remapped frame (1.0 = no extra zoom crop). */
-    private static final double CROP_WIDTH_FRACTION = 0.96;
-    private static final double CROP_MAX_HEIGHT_FRACTION = 0.98;
+    private static final double CROP_WIDTH_FRACTION = 0.90;
+    private static final double CROP_MAX_HEIGHT_FRACTION = 0.86;
     /** 0 = keep the top of the remap, 1 = keep the bottom (ground). */
-    private static final double CROP_Y_BIAS = 0.42;
+    private static final double CROP_Y_BIAS = 0.50;
+    /** Drop rows/cols darker than this after remap (fisheye rim / empty map). */
+    private static final double VALID_LUMA_MIN = 18.0;
+    /** Extra inset of the valid region so the curved fisheye rim is not stretched. */
+    private static final double VALID_INSET_FRACTION = 0.04;
     /** Horizon row in the shared output frame (fraction of height from the top). */
     private static final double HORIZON_FRACTION = 0.40;
     /** Last stitch panel — rear camera (bumper at bottom of raw fisheye). */
@@ -239,8 +243,9 @@ public class VideoStreamingServer {
         private Mat undistorted;
         private Mat cropped;
         private Mat aligned;
-        private Mat groundH;
         private Mat affine;
+        private Rect workCrop;
+        private Rect alignedCrop;
         private int cachedSrcW = -1;
         private int cachedSrcH = -1;
 
@@ -271,34 +276,49 @@ public class VideoStreamingServer {
             Imgproc.remap(src, undistorted, map1, map2, Imgproc.INTER_LINEAR,
                     Core.BORDER_CONSTANT);
 
-            cropFilledPanel(undistorted, cropped);
+            if (workCrop == null) {
+                workCrop = cropWindow(undistorted);
+            }
+            Mat workRoi = undistorted.submat(workCrop);
+            Imgproc.resize(workRoi, cropped, new Size(TARGET_WIDTH, TARGET_HEIGHT),
+                    0, 0, Imgproc.INTER_AREA);
+            workRoi.release();
 
-            if (affine == null || groundH == null) {
+            if (affine == null) {
                 learnGroundLock(cropped);
             }
 
             Imgproc.warpAffine(cropped, aligned, affine,
                     new Size(TARGET_WIDTH, TARGET_HEIGHT),
-                    Imgproc.INTER_LINEAR, Core.BORDER_REPLICATE);
+                    Imgproc.INTER_LINEAR, Core.BORDER_CONSTANT);
 
-            Imgproc.warpPerspective(aligned, dst360x640, groundH,
-                    new Size(TARGET_WIDTH, TARGET_HEIGHT),
-                    Imgproc.INTER_LINEAR, Core.BORDER_REPLICATE);
-
+            if (alignedCrop == null) {
+                alignedCrop = clampRect(
+                        aspectFit(validPixelRect(aligned), TARGET_WIDTH, TARGET_HEIGHT),
+                        aligned.cols(), aligned.rows());
+            }
+            Mat alignedRoi = aligned.submat(alignedCrop);
+            Imgproc.resize(alignedRoi, dst360x640, new Size(TARGET_WIDTH, TARGET_HEIGHT),
+                    0, 0, Imgproc.INTER_AREA);
+            alignedRoi.release();
             forceExactSize(dst360x640);
         }
 
         private void learnGroundLock(Mat panel) {
             double roll = estimateRollDeg(panel);
+            if (Math.abs(roll) > 8.0) {
+                roll = Math.copySign(8.0, roll);
+            }
             int horizon = estimateHorizonRow(panel);
             int targetY = (int) Math.round(HORIZON_FRACTION * TARGET_HEIGHT);
             double dy = targetY - horizon;
+            double maxShift = TARGET_HEIGHT * 0.06;
+            if (dy > maxShift) dy = maxShift;
+            if (dy < -maxShift) dy = -maxShift;
 
             Point center = new Point(TARGET_WIDTH / 2.0, TARGET_HEIGHT / 2.0);
             affine = Imgproc.getRotationMatrix2D(center, roll, 1.0);
             affine.put(1, 2, affine.get(1, 2)[0] + dy);
-
-            groundH = sharedGroundHomography(TARGET_WIDTH, TARGET_HEIGHT);
         }
 
         private void ensureMaps(int srcW, int srcH) {
@@ -323,10 +343,8 @@ public class VideoStreamingServer {
             cachedSrcW = srcW;
             cachedSrcH = srcH;
             affine = null;
-            if (groundH != null) {
-                groundH.release();
-                groundH = null;
-            }
+            workCrop = null;
+            alignedCrop = null;
 
             K.release();
             D.release();
@@ -377,27 +395,105 @@ public class VideoStreamingServer {
     }
 
 
-    static void cropFilledPanel(Mat src, Mat dst) {
-        // Same inner window for every camera so scale and size stay uniform.
-        // Inset drops fisheye vignette; bottom bias keeps the road in frame.
+    static Rect cropWindow(Mat src) {
+        Rect valid = validPixelRect(src);
         double aspect = (double) TARGET_WIDTH / TARGET_HEIGHT;
         int imgW = src.cols();
         int imgH = src.rows();
+
         int cropW = Math.max(2, (int) Math.round(imgW * CROP_WIDTH_FRACTION));
         int cropH = Math.max(2, (int) Math.round(cropW / aspect));
         if (cropH > imgH * CROP_MAX_HEIGHT_FRACTION) {
             cropH = Math.max(2, (int) Math.round(imgH * CROP_MAX_HEIGHT_FRACTION));
             cropW = Math.max(2, (int) Math.round(cropH * aspect));
         }
-        int x = (imgW - cropW) / 2;
-        int y = (int) Math.round((imgH - cropH) * CROP_Y_BIAS);
+
+        cropW = Math.min(cropW, valid.width);
+        cropH = Math.min(cropH, (int) Math.round(cropW / aspect));
+        if (cropH > valid.height) {
+            cropH = valid.height;
+            cropW = Math.max(2, (int) Math.round(cropH * aspect));
+            if (cropW > valid.width) {
+                cropW = valid.width;
+                cropH = Math.max(2, (int) Math.round(cropW / aspect));
+            }
+        }
+
+        int x = valid.x + (valid.width - cropW) / 2;
+        int y = valid.y + (int) Math.round((valid.height - cropH) * CROP_Y_BIAS);
+        x = Math.max(0, Math.min(x, imgW - cropW));
+        y = Math.max(0, Math.min(y, imgH - cropH));
+        return new Rect(x, y, cropW, cropH);
+    }
+
+    static Rect aspectFit(Rect valid, int targetW, int targetH) {
+        double aspect = (double) targetW / targetH;
+        int w = valid.width;
+        int h = valid.height;
+        if ((double) w / h > aspect) {
+            w = Math.max(2, (int) Math.round(h * aspect));
+        } else {
+            h = Math.max(2, (int) Math.round(w / aspect));
+        }
+        int x = valid.x + (valid.width - w) / 2;
+        int y = valid.y + (valid.height - h) / 2;
+        return new Rect(x, y, w, h);
+    }
+
+    static Rect clampRect(Rect r, int imgW, int imgH) {
+        int x = Math.max(0, r.x);
+        int y = Math.max(0, r.y);
+        int w = r.width;
+        int h = r.height;
+        if (x + w > imgW) w = imgW - x;
+        if (y + h > imgH) h = imgH - y;
+        if (w < 1) w = 1;
+        if (h < 1) h = 1;
+        return new Rect(x, y, w, h);
+    }
+
+    /** Filled pixels only, inset so the circular fisheye rim is not stretched. */
+    static Rect validPixelRect(Mat bgr) {
+        int imgW = bgr.cols();
+        int imgH = bgr.rows();
+        Mat gray = new Mat();
+        Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
+        Mat mask = new Mat();
+        Imgproc.threshold(gray, mask, VALID_LUMA_MIN, 255, Imgproc.THRESH_BINARY);
+
+        int k = Math.max(11, Math.min(imgW, imgH) / 28);
+        if ((k & 1) == 0) {
+            k++;
+        }
+        Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, new Size(k, k));
+        Imgproc.erode(mask, mask, kernel);
+        Imgproc.erode(mask, mask, kernel);
+
+        Rect box = Imgproc.boundingRect(mask);
+        gray.release();
+        mask.release();
+        kernel.release();
+
+        if (box.width < imgW / 5 || box.height < imgH / 5) {
+            int padX = (int) Math.round(imgW * 0.08);
+            int padY = (int) Math.round(imgH * 0.10);
+            return new Rect(padX, padY, Math.max(2, imgW - 2 * padX), Math.max(2, imgH - 2 * padY));
+        }
+
+        int insetX = Math.max(2, (int) Math.round(box.width * VALID_INSET_FRACTION));
+        int insetY = Math.max(2, (int) Math.round(box.height * VALID_INSET_FRACTION));
+        int x = box.x + insetX;
+        int y = box.y + insetY;
+        int w = box.width - 2 * insetX;
+        int h = box.height - 2 * insetY;
         if (x < 0) x = 0;
         if (y < 0) y = 0;
-        if (x + cropW > imgW) cropW = imgW - x;
-        if (y + cropH > imgH) cropH = imgH - y;
-        Mat roi = src.submat(new Rect(x, y, cropW, cropH));
-        Imgproc.resize(roi, dst, new Size(TARGET_WIDTH, TARGET_HEIGHT), 0, 0, Imgproc.INTER_AREA);
-        roi.release();
+        if (x + w > imgW) w = imgW - x;
+        if (y + h > imgH) h = imgH - y;
+        if (w < 2 || h < 2) {
+            return new Rect(0, 0, imgW, imgH);
+        }
+        return new Rect(x, y, w, h);
     }
 
     static int estimateHorizonRow(Mat bgr) {
@@ -457,24 +553,6 @@ public class VideoStreamingServer {
         }
         java.util.Collections.sort(angles);
         return angles.get(angles.size() / 2);
-    }
-
-    static Mat sharedGroundHomography(int W, int H) {
-        double hy = HORIZON_FRACTION * H;
-        MatOfPoint2f src = new MatOfPoint2f(
-                new Point(W * 0.08, hy),
-                new Point(W * 0.92, hy),
-                new Point(W - 1.0, H - 1.0),
-                new Point(0.0, H - 1.0));
-        MatOfPoint2f dst = new MatOfPoint2f(
-                new Point(0.0, hy),
-                new Point(W - 1.0, hy),
-                new Point(W - 1.0, H - 1.0),
-                new Point(0.0, H - 1.0));
-        Mat Hm = Imgproc.getPerspectiveTransform(src, dst);
-        src.release();
-        dst.release();
-        return Hm;
     }
 
     static void forceExactSize(Mat img) {
