@@ -25,7 +25,9 @@ public class VideoStreamingServer {
     private static final int DEFAULT_PORT  = 9090;
     private static final int TARGET_HEIGHT = 360;
     private static final int TARGET_WIDTH  = 640;
-    private static final int OVERLAP_PX    = 80;
+    private static final int OVERLAP_PX    = 72;
+    /** Horizon row in the shared output frame (fraction of height from the top). */
+    private static final double HORIZON_FRACTION = 0.40;
     /** Last stitch panel — rear camera (bumper at bottom of raw fisheye). */
     private static final int REAR_CAMERA_INDEX = 3;
 
@@ -98,9 +100,7 @@ public class VideoStreamingServer {
 
         CameraFeedFilter[] undistort = new CameraFeedFilter[videoFiles.length];
         for (int i = 0; i < undistort.length; i++) {
-          undistort[i] = (i == REAR_CAMERA_INDEX)
-              ? new RearFeedPipeline()
-              : new FisheyeUndistorter();
+          undistort[i] = FisheyePanelFilter.forStitchIndex(i);
         }
 
         ex.getResponseHeaders().set("Content-Type", "multipart/x-mixed-replace; boundary=frame");
@@ -192,28 +192,63 @@ public class VideoStreamingServer {
         void recalibrateAndFilter(Mat src, Mat dst360x640);
     }
 
-    //  FISHEYE UNDISTORT LAYER
+    /**
+     * Mount pose for one surround camera. Pitch is virtual-camera tilt in the
+     * OpenCV Y-down frame: negative looks toward the top of the raw fisheye
+     * (street instead of bumper when the lens points at the ground).
+     */
+    static final class PanelPose {
+        final double pitchDeg;
+        final double yawDeg;
+        final double rollDeg;
+        final double inputFovDeg;
+        final double outputFovDeg;
+
+        PanelPose(double pitchDeg, double yawDeg, double rollDeg,
+                  double inputFovDeg, double outputFovDeg) {
+            this.pitchDeg = pitchDeg;
+            this.yawDeg = yawDeg;
+            this.rollDeg = rollDeg;
+            this.inputFovDeg = inputFovDeg;
+            this.outputFovDeg = outputFovDeg;
+        }
+    }
+
+    //  UNIFIED FISHEYE PANEL
     //
-    //  Size-adaptive: K is rebuilt from frame size. Do not send 180° fisheye
-    //  through a pinhole model — tan(90°) is infinite and produces the
-    //  radial starburst. Output is a finite rectilinear crop (default 90°).
+    //  Every feed is remapped with the same output size and FOV, then cropped
+    //  to the filled rectangle (drops circular vignette) and locked onto a
+    //  shared horizon / ground band so the four panels sit on one line.
 
-    static final class FisheyeUndistorter implements CameraFeedFilter {
-
-        /** Assumed diagonal-ish horizontal coverage of the raw fisheye. Keep < 170. */
-        private static final double INPUT_FOV_DEG = 150.0;
-
-        /** Rectilinear view sent to stitch. 80–100 is typical; lower = more zoom. */
-        private static final double OUTPUT_FOV_DEG = 90.0;
+    static final class FisheyePanelFilter implements CameraFeedFilter {
 
         private static final double[] FISHEYE_D = { 0.0, 0.0, 0.0, 0.0 };
+        private static final int WORK_HEIGHT = TARGET_HEIGHT * 2;
+        private static final int WORK_WIDTH  = TARGET_WIDTH * 2;
 
+        private final PanelPose pose;
         private Mat map1;
         private Mat map2;
         private Mat undistorted;
-        private Mat filtered;
+        private Mat cropped;
+        private Mat aligned;
+        private Mat groundH;
+        private Mat affine;
         private int cachedSrcW = -1;
         private int cachedSrcH = -1;
+
+        static FisheyePanelFilter forStitchIndex(int index) {
+            final double inFov  = 160.0;
+            final double outFov = 82.0;
+            if (index == REAR_CAMERA_INDEX) {
+                return new FisheyePanelFilter(new PanelPose(-18.0, 0.0, 0.0, inFov, outFov));
+            }
+            return new FisheyePanelFilter(new PanelPose(-10.0, 0.0, 0.0, inFov, outFov));
+        }
+
+        FisheyePanelFilter(PanelPose pose) {
+            this.pose = pose;
+        }
 
         @Override
         public void recalibrateAndFilter(Mat src, Mat dst360x640) {
@@ -224,19 +259,40 @@ public class VideoStreamingServer {
             ensureMaps(src.cols(), src.rows());
 
             if (undistorted == null) undistorted = new Mat();
-            if (filtered == null)    filtered    = new Mat();
+            if (cropped == null)     cropped     = new Mat();
+            if (aligned == null)     aligned     = new Mat();
 
             Imgproc.remap(src, undistorted, map1, map2, Imgproc.INTER_LINEAR,
                     Core.BORDER_CONSTANT);
 
-            Imgproc.GaussianBlur(undistorted, filtered, new Size(3, 3), 0.6);
+            cropFilledPanel(undistorted, cropped);
 
-            Size target = new Size(TARGET_WIDTH, TARGET_HEIGHT);
-            if (filtered.cols() == TARGET_WIDTH && filtered.rows() == TARGET_HEIGHT) {
-                filtered.copyTo(dst360x640);
-            } else {
-                Imgproc.resize(filtered, dst360x640, target, 0, 0, Imgproc.INTER_AREA);
+            if (affine == null || groundH == null) {
+                learnGroundLock(cropped);
             }
+
+            Imgproc.warpAffine(cropped, aligned, affine,
+                    new Size(TARGET_WIDTH, TARGET_HEIGHT),
+                    Imgproc.INTER_LINEAR, Core.BORDER_REPLICATE);
+
+            Imgproc.warpPerspective(aligned, dst360x640, groundH,
+                    new Size(TARGET_WIDTH, TARGET_HEIGHT),
+                    Imgproc.INTER_LINEAR, Core.BORDER_REPLICATE);
+
+            forceExactSize(dst360x640);
+        }
+
+        private void learnGroundLock(Mat panel) {
+            double roll = estimateRollDeg(panel);
+            int horizon = estimateHorizonRow(panel);
+            int targetY = (int) Math.round(HORIZON_FRACTION * TARGET_HEIGHT);
+            double dy = targetY - horizon;
+
+            Point center = new Point(TARGET_WIDTH / 2.0, TARGET_HEIGHT / 2.0);
+            affine = Imgproc.getRotationMatrix2D(center, roll, 1.0);
+            affine.put(1, 2, affine.get(1, 2)[0] + dy);
+
+            groundH = sharedGroundHomography(TARGET_WIDTH, TARGET_HEIGHT);
         }
 
         private void ensureMaps(int srcW, int srcH) {
@@ -244,12 +300,13 @@ public class VideoStreamingServer {
                 return;
             }
 
-            Size dstSize = new Size(TARGET_WIDTH, TARGET_HEIGHT);
+            Size dstSize = new Size(WORK_WIDTH, WORK_HEIGHT);
 
-            Mat K = equidistantK(srcW, srcH, INPUT_FOV_DEG);
+            Mat K = equidistantK(srcW, srcH, pose.inputFovDeg);
             Mat D = distortionCoeffs();
-            Mat R = Mat.eye(3, 3, CvType.CV_64FC1);
-            Mat P = pinholeK(TARGET_WIDTH, TARGET_HEIGHT, OUTPUT_FOV_DEG);
+            Mat R = eulerRyxz(pose.pitchDeg, pose.yawDeg, pose.rollDeg);
+            Mat P = pinholeK(WORK_WIDTH, WORK_HEIGHT, pose.outputFovDeg);
+            P.put(1, 2, HORIZON_FRACTION * WORK_HEIGHT);
 
             if (map1 == null) map1 = new Mat();
             if (map2 == null) map2 = new Mat();
@@ -259,6 +316,11 @@ public class VideoStreamingServer {
 
             cachedSrcW = srcW;
             cachedSrcH = srcH;
+            affine = null;
+            if (groundH != null) {
+                groundH.release();
+                groundH = null;
+            }
 
             K.release();
             D.release();
@@ -266,14 +328,12 @@ public class VideoStreamingServer {
             P.release();
         }
 
-        /** r = f * theta. fx == fy so aspect ratio is preserved. */
         static Mat equidistantK(int width, int height, double fovDeg) {
             double half = Math.toRadians(fovDeg) / 2.0;
-            double f = (Math.max(width, height) / 2.0) / half;
+            double f = (Math.min(width, height) / 2.0) / half;
             return matrixK(f, f, width / 2.0, height / 2.0);
         }
 
-        /** r = f * tan(theta). FOV must stay well below 180°. */
         static Mat pinholeK(int width, int height, double fovDeg) {
             double half = Math.toRadians(fovDeg) / 2.0;
             double f = (width / 2.0) / Math.tan(half);
@@ -311,95 +371,114 @@ public class VideoStreamingServer {
     }
 
 
-    //  REAR CAMERA PIPELINE
-    //
-    //  The rear fisheye sits low and looks down: bumper / plate fill the bottom
-    //  of the circle and the street sits in the upper FOV. A separate pitch-up
-    //  remap + top crop keeps horizon/road and drops the number plate.
-    //  Only this block is used for stitch index REAR_CAMERA_INDEX.
-
-    static final class RearFeedPipeline implements CameraFeedFilter {
-
-        /** Degrees to tilt the virtual camera toward the top of the raw frame. */
-        private static final double LOOK_UP_DEG = 18.0;
-
-        /** Clockwise-positive in the image. Set negative to counter a clockwise roll. */
-        private static final double ROLL_DEG = 0.0;
-
-        private static final double INPUT_FOV_DEG  = 160.0;
-        private static final double OUTPUT_FOV_DEG = 88.0;
-
-        /** Skip this much from the top of the remapped frame (camera housing). */
-        private static final double TOP_SKIP_FRACTION = 0.10;
-
-        /**
-         * Vertical window after skip. Higher includes more road / bumper;
-         * lower stays on trees/sky.
-         */
-        private static final double KEEP_FRACTION = 0.72;
-
-        private Mat map1;
-        private Mat map2;
-        private Mat undistorted;
-        private int cachedSrcW = -1;
-        private int cachedSrcH = -1;
-        private int mapH = TARGET_HEIGHT;
-
-        @Override
-        public void recalibrateAndFilter(Mat src, Mat dst360x640) {
-            if (src == null || src.empty()) {
-                return;
-            }
-
-            ensureMaps(src.cols(), src.rows());
-
-            if (undistorted == null) undistorted = new Mat();
-
-            Imgproc.remap(src, undistorted, map1, map2, Imgproc.INTER_LINEAR);
-
-            int h = undistorted.rows();
-            int skip = (int) Math.round(h * TOP_SKIP_FRACTION);
-            int keepH = Math.max(1, (int) Math.round(h * KEEP_FRACTION));
-            if (skip + keepH > h) {
-                keepH = h - skip;
-            }
-            if (keepH < 1) {
-                skip = 0;
-                keepH = h;
-            }
-            Mat window = undistorted.rowRange(skip, skip + keepH);
-            Imgproc.resize(window, dst360x640, new Size(TARGET_WIDTH, TARGET_HEIGHT),
-                    0, 0, Imgproc.INTER_AREA);
+    static void cropFilledPanel(Mat src, Mat dst) {
+        // Same inner window for every camera so scale and size stay uniform.
+        // Inset drops fisheye vignette; bottom bias keeps the road in frame.
+        double aspect = (double) TARGET_WIDTH / TARGET_HEIGHT;
+        int imgW = src.cols();
+        int imgH = src.rows();
+        int cropW = Math.max(2, (int) Math.round(imgW * 0.86));
+        int cropH = Math.max(2, (int) Math.round(cropW / aspect));
+        if (cropH > imgH * 0.90) {
+            cropH = Math.max(2, (int) Math.round(imgH * 0.90));
+            cropW = Math.max(2, (int) Math.round(cropH * aspect));
         }
+        int x = (imgW - cropW) / 2;
+        int y = (int) Math.round((imgH - cropH) * 0.70);
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        if (x + cropW > imgW) cropW = imgW - x;
+        if (y + cropH > imgH) cropH = imgH - y;
+        Mat roi = src.submat(new Rect(x, y, cropW, cropH));
+        Imgproc.resize(roi, dst, new Size(TARGET_WIDTH, TARGET_HEIGHT), 0, 0, Imgproc.INTER_AREA);
+        roi.release();
+    }
 
-        private void ensureMaps(int srcW, int srcH) {
-            if (map1 != null && srcW == cachedSrcW && srcH == cachedSrcH) {
-                return;
+    static int estimateHorizonRow(Mat bgr) {
+        Mat gray = new Mat();
+        Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
+        Imgproc.GaussianBlur(gray, gray, new Size(9, 9), 1.4);
+        Mat sobel = new Mat();
+        Imgproc.Sobel(gray, sobel, CvType.CV_32F, 0, 1, 3);
+        Mat mag = new Mat();
+        Core.convertScaleAbs(sobel, mag);
+        sobel.release();
+        sobel = mag;
+
+        int h = gray.rows();
+        int w = gray.cols();
+        int x0 = w / 5;
+        int x1 = w - w / 5;
+        int y0 = Math.max(1, (int) (h * 0.14));
+        int y1 = Math.max(y0 + 1, (int) (h * 0.62));
+        int fallback = (int) Math.round(HORIZON_FRACTION * h);
+
+        double best = -1;
+        int bestY = fallback;
+        for (int y = y0; y < y1; y++) {
+            double s = Core.sumElems(sobel.row(y).colRange(x0, x1)).val[0];
+            if (s > best) {
+                best = s;
+                bestY = y;
             }
-
-            mapH = (int) Math.round(TARGET_HEIGHT / KEEP_FRACTION);
-            Size dstSize = new Size(TARGET_WIDTH, mapH);
-
-            Mat K = FisheyeUndistorter.equidistantK(srcW, srcH, INPUT_FOV_DEG);
-            Mat D = FisheyeUndistorter.distortionCoeffs();
-            // Negative pitch (Y-down camera) aims the virtual view at the top of the fisheye.
-            Mat R = FisheyeUndistorter.eulerRyxz(-LOOK_UP_DEG, 0.0, ROLL_DEG);
-            Mat P = FisheyeUndistorter.pinholeK(TARGET_WIDTH, mapH, OUTPUT_FOV_DEG);
-
-            if (map1 == null) map1 = new Mat();
-            if (map2 == null) map2 = new Mat();
-
-            Calib3d.fisheye_initUndistortRectifyMap(
-                    K, D, R, P, dstSize, CvType.CV_16SC2, map1, map2);
-
-            cachedSrcW = srcW;
-            cachedSrcH = srcH;
-
-            K.release();
-            D.release();
-            R.release();
-            P.release();
         }
+        gray.release();
+        sobel.release();
+        return bestY;
+    }
+
+    static double estimateRollDeg(Mat bgr) {
+        Mat gray = new Mat();
+        Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
+        Imgproc.Canny(gray, gray, 55, 150);
+        Mat lines = new Mat();
+        Imgproc.HoughLinesP(gray, lines, 1, Math.PI / 180.0, 55, 48, 12);
+        ArrayList<Double> angles = new ArrayList<>();
+        for (int i = 0; i < lines.rows(); i++) {
+            double[] l = lines.get(i, 0);
+            if (l == null || l.length < 4) continue;
+            double ang = Math.toDegrees(Math.atan2(l[3] - l[1], l[2] - l[0]));
+            while (ang > 90)  ang -= 180;
+            while (ang < -90) ang += 180;
+            if (Math.abs(ang) <= 22) {
+                angles.add(ang);
+            }
+        }
+        gray.release();
+        lines.release();
+        if (angles.size() < 4) {
+            return 0.0;
+        }
+        java.util.Collections.sort(angles);
+        return angles.get(angles.size() / 2);
+    }
+
+    static Mat sharedGroundHomography(int W, int H) {
+        double hy = HORIZON_FRACTION * H;
+        MatOfPoint2f src = new MatOfPoint2f(
+                new Point(W * 0.18, hy),
+                new Point(W * 0.82, hy),
+                new Point(W - 1.0, H - 1.0),
+                new Point(0.0, H - 1.0));
+        MatOfPoint2f dst = new MatOfPoint2f(
+                new Point(0.0, hy),
+                new Point(W - 1.0, hy),
+                new Point(W - 1.0, H - 1.0),
+                new Point(0.0, H - 1.0));
+        Mat Hm = Imgproc.getPerspectiveTransform(src, dst);
+        src.release();
+        dst.release();
+        return Hm;
+    }
+
+    static void forceExactSize(Mat img) {
+        if (img.cols() == TARGET_WIDTH && img.rows() == TARGET_HEIGHT) {
+            return;
+        }
+        Mat tmp = new Mat();
+        Imgproc.resize(img, tmp, new Size(TARGET_WIDTH, TARGET_HEIGHT), 0, 0, Imgproc.INTER_AREA);
+        tmp.copyTo(img);
+        tmp.release();
     }
 
 
@@ -417,9 +496,10 @@ public class VideoStreamingServer {
         Mat accumWeight = Mat.zeros(H, panoW, CvType.CV_32FC1);
 
         for (int i = 0; i < N; i++) {
+            forceExactSize(frames[i]);
             int xStart = i * (W - overlap);
 
-            Mat weight = buildFeatherMask(H, W, overlap);
+            Mat weight = buildFeatherMask(H, W, overlap, i > 0, i < N - 1);
 
             Mat frameF = new Mat();
             frames[i].convertTo(frameF, CvType.CV_32FC3);
@@ -469,13 +549,22 @@ public class VideoStreamingServer {
         return result;
     }
 
-    static Mat buildFeatherMask(int H, int W, int overlap) {
+    static Mat buildFeatherMask(int H, int W, int overlap, boolean fadeLeft, boolean fadeRight) {
         Mat mask = new Mat(H, W, CvType.CV_32FC1, new Scalar(1.0));
+        if (overlap <= 0) {
+            return mask;
+        }
         for (int x = 0; x < overlap; x++) {
             float alpha = (float) x / overlap;
-            for (int y = 0; y < H; y++) {
-                mask.put(y, x,          new float[]{ alpha });
-                mask.put(y, W - 1 - x,  new float[]{ alpha });
+            if (fadeLeft) {
+                Mat colL = mask.col(x);
+                colL.setTo(new Scalar(alpha));
+                colL.release();
+            }
+            if (fadeRight) {
+                Mat colR = mask.col(W - 1 - x);
+                colR.setTo(new Scalar(alpha));
+                colR.release();
             }
         }
         return mask;
