@@ -26,6 +26,13 @@ public class VideoStreamingServer {
     private static final int TARGET_HEIGHT = 360;
     private static final int TARGET_WIDTH  = 640;
     private static final int OVERLAP_PX    = 72;
+    /** Horizontal FOV of each rectified panel. Higher = more zoomed out. */
+    private static final double OUTPUT_FOV_DEG = 104.0;
+    /** Keep this fraction of the remapped frame (1.0 = no extra zoom crop). */
+    private static final double CROP_WIDTH_FRACTION = 0.96;
+    private static final double CROP_MAX_HEIGHT_FRACTION = 0.98;
+    /** 0 = keep the top of the remap, 1 = keep the bottom (ground). */
+    private static final double CROP_Y_BIAS = 0.42;
     /** Horizon row in the shared output frame (fraction of height from the top). */
     private static final double HORIZON_FRACTION = 0.40;
     /** Last stitch panel — rear camera (bumper at bottom of raw fisheye). */
@@ -239,11 +246,10 @@ public class VideoStreamingServer {
 
         static FisheyePanelFilter forStitchIndex(int index) {
             final double inFov  = 160.0;
-            final double outFov = 82.0;
             if (index == REAR_CAMERA_INDEX) {
-                return new FisheyePanelFilter(new PanelPose(-18.0, 0.0, 0.0, inFov, outFov));
+                return new FisheyePanelFilter(new PanelPose(-12.0, 0.0, 0.0, inFov, OUTPUT_FOV_DEG));
             }
-            return new FisheyePanelFilter(new PanelPose(-10.0, 0.0, 0.0, inFov, outFov));
+            return new FisheyePanelFilter(new PanelPose(-6.0, 0.0, 0.0, inFov, OUTPUT_FOV_DEG));
         }
 
         FisheyePanelFilter(PanelPose pose) {
@@ -377,14 +383,14 @@ public class VideoStreamingServer {
         double aspect = (double) TARGET_WIDTH / TARGET_HEIGHT;
         int imgW = src.cols();
         int imgH = src.rows();
-        int cropW = Math.max(2, (int) Math.round(imgW * 0.86));
+        int cropW = Math.max(2, (int) Math.round(imgW * CROP_WIDTH_FRACTION));
         int cropH = Math.max(2, (int) Math.round(cropW / aspect));
-        if (cropH > imgH * 0.90) {
-            cropH = Math.max(2, (int) Math.round(imgH * 0.90));
+        if (cropH > imgH * CROP_MAX_HEIGHT_FRACTION) {
+            cropH = Math.max(2, (int) Math.round(imgH * CROP_MAX_HEIGHT_FRACTION));
             cropW = Math.max(2, (int) Math.round(cropH * aspect));
         }
         int x = (imgW - cropW) / 2;
-        int y = (int) Math.round((imgH - cropH) * 0.70);
+        int y = (int) Math.round((imgH - cropH) * CROP_Y_BIAS);
         if (x < 0) x = 0;
         if (y < 0) y = 0;
         if (x + cropW > imgW) cropW = imgW - x;
@@ -456,8 +462,8 @@ public class VideoStreamingServer {
     static Mat sharedGroundHomography(int W, int H) {
         double hy = HORIZON_FRACTION * H;
         MatOfPoint2f src = new MatOfPoint2f(
-                new Point(W * 0.18, hy),
-                new Point(W * 0.82, hy),
+                new Point(W * 0.08, hy),
+                new Point(W * 0.92, hy),
                 new Point(W - 1.0, H - 1.0),
                 new Point(0.0, H - 1.0));
         MatOfPoint2f dst = new MatOfPoint2f(
