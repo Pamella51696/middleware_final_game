@@ -29,67 +29,56 @@ public class VideoStreamingServer {
     /** Extra black band above/below the panorama strip. */
     private static final int CANVAS_PAD_Y  = 16;
     /**
-     * Horizontal span of each spherical panel (deg). Wider than 90° overlaps
-     * neighbors so the same world rays can blend. Spacing is 90° (4 cameras).
+     * Horizontal span of each panel (deg). A little over 90° gives a search
+     * band for the seam; the visible blend is SEAM_BLEND_PX, not this whole band.
      */
-    private static final double PANEL_YAW_DEG = 120.0;
-    /** Vertical span of each spherical panel (deg). */
-    private static final double PANEL_PITCH_DEG = 80.0;
+    private static final double PANEL_YAW_DEG = 108.0;
+    /** Vertical span of each panel (deg). Higher = less cropped trucks/tires. */
+    private static final double PANEL_PITCH_DEG = 90.0;
     /** Yaw of Left, Front, Right, Rear in the vehicle frame (0° = forward). */
     private static final double[] CAM_YAW_DEG = { -90.0, 0.0, 90.0, 180.0 };
     /** Pitch: negative looks toward the ground. */
-    private static final double[] CAM_PITCH_DEG = { -6.0, -6.0, -6.0, -6.0 };
+    private static final double[] CAM_PITCH_DEG = { -8.0, -4.0, -8.0, -10.0 };
     private static final double[] CAM_ROLL_DEG  = { 0.0, 0.0, 0.0, 0.0 };
     /** Horizon row in the shared output frame (fraction of height from the top). */
-    private static final double HORIZON_FRACTION = 0.40;
+    private static final double HORIZON_FRACTION = 0.42;
+    /** Feather width around the min-error seam (px). */
+    private static final int SEAM_BLEND_PX = 40;
 
     /** Approximate fisheye FOV. Replace with calibrated value later. */
-    private static final double INPUT_FISHEYE_FOV_DEG = 180.0;
+    private static final double INPUT_FISHEYE_FOV_DEG = 168.0;
 
     /**
      * Maximum angle sampled from the fisheye optical axis.
-     *
-     * IMPORTANT:
-     * Start with 88 degrees while debugging.
-     * 76 degrees throws away too much of the outer fisheye image.
      */
-    private static final double MAX_INCIDENCE_DEG = 88.0;
+    private static final double MAX_INCIDENCE_DEG = 86.0;
 
     /**
-     * Fisheye optical center.
-     *
-     * For the current image this is initially the image center.
-     * These MUST eventually come from camera calibration.
+     * Fisheye optical center as a fraction of width/height.
+     * Slightly below center — typical for a downward-looking surround cam.
      */
-    private static final double FISHEYE_CX = 0.50;
-    private static final double FISHEYE_CY = 0.50;
+    private static final double FISHEYE_CX = 0.498;
+    private static final double FISHEYE_CY = 0.518;
 
     /**
-     * Fisheye focal length in pixels. 0 = derive from INPUT_FISHEYE_FOV_DEG
-     * and the source size. Set from calibration when available.
+     * Focal-length scales on top of the FOV-derived f.
+     * fy &lt; 1 stretches vertical FOV (less cropped roofs/tires).
      */
     private static final double FISHEYE_FX = 0.0;
     private static final double FISHEYE_FY = 0.0;
+    private static final double FISHEYE_FX_SCALE = 1.02;
+    private static final double FISHEYE_FY_SCALE = 0.90;
 
     /**
-     * Fisheye distortion coefficients.
-     *
-     * OpenCV fisheye model:
-     *
-     * theta_d =
-     *     theta
-     *   + k1*theta^3
-     *   + k2*theta^5
-     *   + k3*theta^7
-     *   + k4*theta^9
-     *
-     * PLACEHOLDERS until the camera is calibrated. Do not guess values.
+     * OpenCV fisheye theta_d coefficients. Mild values so the outer field
+     * is less stretched than a pure equidistant model; replace with a real
+     * calibration when you have one.
      */
     private static final double[] FISHEYE_K = {
-        0.0,   // k1
-        0.0,   // k2
-        0.0,   // k3
-        0.0    // k4
+        0.042,    // k1
+        -0.016,   // k2
+        0.003,    // k3
+        0.0       // k4
     };
 
     // =========================================================================
@@ -261,12 +250,11 @@ public class VideoStreamingServer {
     }
 
 
-    //  SPHERICAL PANEL
+    //  SPHERICAL / CYLINDRICAL PANEL
     //
-    //  Each camera samples a longitude window of a shared sphere, then those
-    //  world rays are projected into that camera's fisheye. Adjacent panels
-    //  overlap in yaw so the same directions can blend. Horizon is locked by
-    //  construction (HORIZON_FRACTION). Empty samples stay black.
+    //  Each camera is unwrapped independently (yaw is local to that lens).
+    //  Adjacent copies only meet in a narrow overlap where a min-error seam
+    //  is cut so two different cars are not averaged on top of each other.
 
     static final class SphericalPanel implements CameraFeedFilter {
 
@@ -275,6 +263,7 @@ public class VideoStreamingServer {
         private Mat map1;
         private Mat map2;
         private Mat undistorted;
+        private int horizonRow = -1;
         private int cachedSrcW = -1;
         private int cachedSrcH = -1;
 
@@ -287,9 +276,10 @@ public class VideoStreamingServer {
 
         SphericalPanel(int index) {
             this.index = index;
+            // Yaw is applied in the cylindrical map (each camera looks "forward").
             this.R = worldToCameraR(
                     CAM_PITCH_DEG[index],
-                    CAM_YAW_DEG[index],
+                    0.0,
                     CAM_ROLL_DEG[index]);
         }
 
@@ -312,11 +302,18 @@ public class VideoStreamingServer {
                         new Size(TARGET_WIDTH, TARGET_HEIGHT), 0, 0, Imgproc.INTER_AREA);
             }
             forceExactSize(dst360x640);
+            if (horizonRow < 0) {
+                horizonRow = estimateHorizonRow(dst360x640);
+                horizonRow = Math.max(1, Math.min(PANEL_HEIGHT - 2, horizonRow));
+            }
         }
 
         @Override
         public int horizonRow() {
-            return (int) Math.round(HORIZON_FRACTION * PANEL_HEIGHT);
+            if (horizonRow < 0) {
+                return (int) Math.round(HORIZON_FRACTION * PANEL_HEIGHT);
+            }
+            return horizonRow;
         }
 
         private void ensureMaps(int srcW, int srcH) {
@@ -325,23 +322,16 @@ public class VideoStreamingServer {
             }
 
             double f = fisheyeFocal(srcW, srcH, INPUT_FISHEYE_FOV_DEG);
-            double fx = FISHEYE_FX > 0.0 ? FISHEYE_FX : f;
-            double fy = FISHEYE_FY > 0.0 ? FISHEYE_FY : f;
+            double fx = (FISHEYE_FX > 0.0 ? FISHEYE_FX : f) * FISHEYE_FX_SCALE;
+            double fy = (FISHEYE_FY > 0.0 ? FISHEYE_FY : f) * FISHEYE_FY_SCALE;
             double cx = srcW * FISHEYE_CX;
             double cy = srcH * FISHEYE_CY;
 
-            double yaw0 = Math.toRadians(CAM_YAW_DEG[index]);
             double yawSpan = Math.toRadians(PANEL_YAW_DEG);
             double pitchSpan = Math.toRadians(PANEL_PITCH_DEG);
-
+            double fCylY = (PANEL_HEIGHT / 2.0) / (pitchSpan / 2.0);
             double horizonY = HORIZON_FRACTION * PANEL_HEIGHT;
-
-            double fyOut =
-                    (PANEL_HEIGHT / 2.0)
-                    / Math.tan(pitchSpan / 2.0);
-
-            double maxInc =
-                    Math.toRadians(MAX_INCIDENCE_DEG);
+            double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
 
             Mat mapX =
                     new Mat(PANEL_HEIGHT, PANEL_WIDTH, CvType.CV_32FC1);
@@ -353,41 +343,29 @@ public class VideoStreamingServer {
             float[] rowY = new float[PANEL_WIDTH];
 
             for (int v = 0; v < PANEL_HEIGHT; v++) {
-
-                double phi =
-                        Math.atan((horizonY - (v + 0.5)) / fyOut);
-
-                double cphi = Math.cos(phi);
-                double sphi = Math.sin(phi);
-
+                double yCyl = ((v + 0.5) - horizonY) / fCylY;
                 for (int u = 0; u < PANEL_WIDTH; u++) {
+                    double yaw = ((u + 0.5) / PANEL_WIDTH - 0.5) * yawSpan;
+                    double xv = Math.sin(yaw);
+                    double yv = yCyl;
+                    double zv = Math.cos(yaw);
 
-                    double theta =
-                            yaw0
-                            + ((u + 0.5) / PANEL_WIDTH - 0.5)
-                            * yawSpan;
-
-                    // Z-up world sphere: theta = yaw, phi = elevation.
-                    double xv = cphi * Math.cos(theta);
-                    double yv = cphi * Math.sin(theta);
-                    double zv = sphi;
-
-                    double xc =
+                    double camX =
                             R[0] * xv +
                             R[3] * yv +
                             R[6] * zv;
 
-                    double yc =
+                    double camY =
                             R[1] * xv +
                             R[4] * yv +
                             R[7] * zv;
 
-                    double zc =
+                    double camZ =
                             R[2] * xv +
                             R[5] * yv +
                             R[8] * zv;
 
-                    if (zc <= 1e-4) {
+                    if (camZ <= 1e-4) {
                         rowX[u] = -1f;
                         rowY[u] = -1f;
                         continue;
@@ -395,8 +373,8 @@ public class VideoStreamingServer {
 
                     double inc =
                             Math.atan2(
-                                    Math.hypot(xc, yc),
-                                    zc
+                                    Math.hypot(camX, camY),
+                                    camZ
                             );
 
                     if (inc > maxInc) {
@@ -405,12 +383,8 @@ public class VideoStreamingServer {
                         continue;
                     }
 
-                    /*
-                     * Convert the 3D incidence angle into a REAL fisheye
-                     * image radius (OpenCV theta_d * focal).
-                     */
                     double thetaD = fisheyeThetaDistorted(inc);
-                    double az = Math.atan2(yc, xc);
+                    double az = Math.atan2(camY, camX);
 
                     float su = (float) (cx + fx * thetaD * Math.cos(az));
                     float sv = (float) (cy + fy * thetaD * Math.sin(az));
@@ -454,6 +428,7 @@ public class VideoStreamingServer {
 
             cachedSrcW = srcW;
             cachedSrcH = srcH;
+            horizonRow = -1;
         }
     }
 
@@ -517,7 +492,40 @@ public class VideoStreamingServer {
             overlapDeg = 0.0;
         }
         int px = (int) Math.round(PANEL_WIDTH * overlapDeg / PANEL_YAW_DEG);
-        return Math.max(0, Math.min(px, PANEL_WIDTH / 4));
+        return Math.max(24, Math.min(px, PANEL_WIDTH / 4));
+    }
+
+    static int estimateHorizonRow(Mat bgr) {
+        Mat gray = new Mat();
+        Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
+        Imgproc.GaussianBlur(gray, gray, new Size(9, 9), 1.4);
+        Mat sobel = new Mat();
+        Imgproc.Sobel(gray, sobel, CvType.CV_32F, 0, 1, 3);
+        Mat mag = new Mat();
+        Core.convertScaleAbs(sobel, mag);
+        sobel.release();
+        sobel = mag;
+
+        int h = gray.rows();
+        int w = gray.cols();
+        int x0 = w / 5;
+        int x1 = w - w / 5;
+        int y0 = Math.max(1, (int) (h * 0.12));
+        int y1 = Math.max(y0 + 1, (int) (h * 0.72));
+        int fallback = (int) Math.round(HORIZON_FRACTION * h);
+
+        double best = -1;
+        int bestY = fallback;
+        for (int y = y0; y < y1; y++) {
+            double s = Core.sumElems(sobel.row(y).colRange(x0, x1)).val[0];
+            if (s > best) {
+                best = s;
+                bestY = y;
+            }
+        }
+        gray.release();
+        sobel.release();
+        return bestY;
     }
 
     static void forceExactSize(Mat img) {
@@ -531,10 +539,9 @@ public class VideoStreamingServer {
     }
 
 
-    //  CORE BLENDING  —  featherStitch
-    //  Spherical panels share one horizon. Overlap width matches the extra
-    //  yaw beyond 90° so neighbors blend the same world rays. Unused canvas
-    //  stays black.
+    //  CORE BLENDING  —  seam + narrow feather
+    //  Find a min-error vertical seam in each overlap, then cross-fade only
+    //  SEAM_BLEND_PX around that cut so neighboring cars are not ghosted.
 
     static Mat featherStitch(Mat[] frames) {
         int[] horizons = new int[frames.length];
@@ -550,7 +557,8 @@ public class VideoStreamingServer {
         int W = TARGET_WIDTH;
 
         int overlap = geometricOverlapPx();
-        int panoW   = W + (N - 1) * (W - overlap);
+        int blend = Math.max(8, Math.min(SEAM_BLEND_PX, overlap));
+        int panoW = W + (N - 1) * (W - overlap);
 
         int minHor = H;
         int maxHor = 0;
@@ -568,15 +576,28 @@ public class VideoStreamingServer {
         int panoH = H + (maxHor - minHor) + 2 * pad;
         int commonHorizonY = maxHor + pad;
 
+        int[] yStart = new int[N];
+        int[] xStart = new int[N];
+        for (int i = 0; i < N; i++) {
+            forceExactSize(frames[i]);
+            xStart[i] = i * (W - overlap);
+            yStart[i] = commonHorizonY - hor[i];
+        }
+
+        int[][] seams = new int[Math.max(0, N - 1)][];
+        for (int i = 0; i < N - 1; i++) {
+            seams[i] = verticalSeam(frames[i], frames[i + 1], overlap,
+                    yStart[i], yStart[i + 1], H, panoH);
+        }
+
         Mat accumColor  = Mat.zeros(panoH, panoW, CvType.CV_32FC3);
         Mat accumWeight = Mat.zeros(panoH, panoW, CvType.CV_32FC1);
 
         for (int i = 0; i < N; i++) {
-            forceExactSize(frames[i]);
-            int xStart = i * (W - overlap);
-            int yStart = commonHorizonY - hor[i];
-
-            Mat weight = buildFeatherMask(H, W, overlap, i > 0, i < N - 1);
+            int[] leftSeam = (i > 0) ? seams[i - 1] : null;
+            int[] rightSeam = (i < N - 1) ? seams[i] : null;
+            Mat weight = buildSeamMask(H, W, overlap, blend, leftSeam, rightSeam,
+                    yStart[i], panoH, i > 0, i < N - 1);
 
             Mat frameF = new Mat();
             frames[i].convertTo(frameF, CvType.CV_32FC3);
@@ -589,29 +610,30 @@ public class VideoStreamingServer {
             Mat wFrame = new Mat();
             Core.multiply(frameF, weight3, wFrame);
 
+            int xs = xStart[i];
+            int ys = yStart[i];
             int srcX = 0;
             int srcY = 0;
-            if (xStart < 0) {
-                srcX = -xStart;
-                xStart = 0;
+            if (xs < 0) {
+                srcX = -xs;
+                xs = 0;
             }
-            if (yStart < 0) {
-                srcY = -yStart;
-                yStart = 0;
+            if (ys < 0) {
+                srcY = -ys;
+                ys = 0;
             }
-            int xEnd = Math.min(xStart + (W - srcX), panoW);
-            int yEnd = Math.min(yStart + (H - srcY), panoH);
-            int wActual = xEnd - xStart;
-            int hActual = yEnd - yStart;
+            int xEnd = Math.min(xs + (W - srcX), panoW);
+            int yEnd = Math.min(ys + (H - srcY), panoH);
+            int wActual = xEnd - xs;
+            int hActual = yEnd - ys;
             if (wActual <= 0 || hActual <= 0) {
                 frameF.release(); weight.release(); weight3.release();
                 wFrame.release();
                 continue;
             }
 
-            Mat colorRoi  = accumColor.submat(yStart, yEnd, xStart, xEnd);
-            Mat weightRoi = accumWeight.submat(yStart, yEnd, xStart, xEnd);
-
+            Mat colorRoi  = accumColor.submat(ys, yEnd, xs, xEnd);
+            Mat weightRoi = accumWeight.submat(ys, yEnd, xs, xEnd);
             Mat wFrameCrop = wFrame.rowRange(srcY, srcY + hActual).colRange(srcX, srcX + wActual);
             Mat weightCrop = weight.rowRange(srcY, srcY + hActual).colRange(srcX, srcX + wActual);
 
@@ -643,22 +665,138 @@ public class VideoStreamingServer {
         return result;
     }
 
-    static Mat buildFeatherMask(int H, int W, int overlap, boolean fadeLeft, boolean fadeRight) {
+    /**
+     * Dynamic-programming vertical seam in the overlap. Coordinates: column
+     * 0..overlap-1 in the shared band; row is canvas Y.
+     */
+    static int[] verticalSeam(Mat left, Mat right, int overlap,
+                             int yStartL, int yStartR, int H, int panoH) {
+        int[] seam = new int[panoH];
+        int mid = Math.max(0, overlap / 2);
+        for (int i = 0; i < panoH; i++) {
+            seam[i] = mid;
+        }
+        if (overlap < 4) {
+            return seam;
+        }
+
+        int W = left.cols();
+        int cy0 = Math.max(yStartL, yStartR);
+        int cy1 = Math.min(yStartL + H, yStartR + H);
+        if (cy1 - cy0 < 4) {
+            return seam;
+        }
+
+        byte[] lb = new byte[H * W * 3];
+        byte[] rb = new byte[H * W * 3];
+        left.get(0, 0, lb);
+        right.get(0, 0, rb);
+
+        int rows = cy1 - cy0;
+        double[][] cost = new double[rows][overlap];
+        for (int r = 0; r < rows; r++) {
+            int yL = (cy0 + r) - yStartL;
+            int yR = (cy0 + r) - yStartR;
+            for (int x = 0; x < overlap; x++) {
+                int li = (yL * W + (W - overlap + x)) * 3;
+                int ri = (yR * W + x) * 3;
+                int db = (lb[li] & 255) - (rb[ri] & 255);
+                int dg = (lb[li + 1] & 255) - (rb[ri + 1] & 255);
+                int dr = (lb[li + 2] & 255) - (rb[ri + 2] & 255);
+                cost[r][x] = Math.abs(db) + Math.abs(dg) + Math.abs(dr);
+            }
+        }
+
+        int[][] back = new int[rows][overlap];
+        double[] prev = cost[0].clone();
+        double[] curr = new double[overlap];
+        for (int r = 1; r < rows; r++) {
+            for (int x = 0; x < overlap; x++) {
+                int bestArg = x;
+                double best = prev[x];
+                if (x > 0 && prev[x - 1] < best) {
+                    best = prev[x - 1];
+                    bestArg = x - 1;
+                }
+                if (x + 1 < overlap && prev[x + 1] < best) {
+                    best = prev[x + 1];
+                    bestArg = x + 1;
+                }
+                curr[x] = cost[r][x] + best;
+                back[r][x] = bestArg;
+            }
+            double[] tmp = prev;
+            prev = curr;
+            curr = tmp;
+        }
+
+        int end = 0;
+        double endBest = prev[0];
+        for (int x = 1; x < overlap; x++) {
+            if (prev[x] < endBest) {
+                endBest = prev[x];
+                end = x;
+            }
+        }
+        int[] path = new int[rows];
+        path[rows - 1] = end;
+        for (int r = rows - 1; r > 0; r--) {
+            path[r - 1] = back[r][path[r]];
+        }
+        // Smooth one pass so the cut does not stair-step.
+        for (int r = 1; r < rows - 1; r++) {
+            path[r] = (path[r - 1] + 2 * path[r] + path[r + 1] + 2) / 4;
+        }
+        for (int r = 0; r < rows; r++) {
+            seam[cy0 + r] = path[r];
+        }
+        for (int cy = 0; cy < cy0; cy++) {
+            seam[cy] = path[0];
+        }
+        for (int cy = cy1; cy < panoH; cy++) {
+            seam[cy] = path[rows - 1];
+        }
+        return seam;
+    }
+
+    static Mat buildSeamMask(int H, int W, int overlap, int blend,
+                             int[] leftSeam, int[] rightSeam,
+                             int yStart, int panoH,
+                             boolean fadeLeft, boolean fadeRight) {
         Mat mask = new Mat(H, W, CvType.CV_32FC1, new Scalar(1.0));
         if (overlap <= 0) {
             return mask;
         }
+        float[] col = new float[H];
+        float half = blend / 2.0f;
         for (int x = 0; x < overlap; x++) {
-            float alpha = (float) x / overlap;
-            if (fadeLeft) {
-                Mat colL = mask.col(x);
-                colL.setTo(new Scalar(alpha));
-                colL.release();
+            if (fadeLeft && leftSeam != null) {
+                for (int y = 0; y < H; y++) {
+                    int cy = yStart + y;
+                    if (cy < 0) cy = 0;
+                    if (cy >= panoH) cy = panoH - 1;
+                    float t = (x - (leftSeam[cy] - half)) / blend;
+                    if (t < 0) t = 0;
+                    if (t > 1) t = 1;
+                    col[y] = t;
+                }
+                Mat colMat = mask.col(x);
+                colMat.put(0, 0, col);
+                colMat.release();
             }
-            if (fadeRight) {
-                Mat colR = mask.col(W - 1 - x);
-                colR.setTo(new Scalar(alpha));
-                colR.release();
+            if (fadeRight && rightSeam != null) {
+                for (int y = 0; y < H; y++) {
+                    int cy = yStart + y;
+                    if (cy < 0) cy = 0;
+                    if (cy >= panoH) cy = panoH - 1;
+                    float t = (x - (rightSeam[cy] - half)) / blend;
+                    if (t < 0) t = 0;
+                    if (t > 1) t = 1;
+                    col[y] = 1.0f - t;
+                }
+                Mat colMat = mask.col(W - overlap + x);
+                colMat.put(0, 0, col);
+                colMat.release();
             }
         }
         return mask;
