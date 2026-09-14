@@ -4,14 +4,20 @@ import com.sun.net.httpserver.HttpServer;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.opencv.calib3d.Calib3d;
 import org.opencv.core.*;
@@ -89,11 +95,14 @@ public class VideoStreamingServer {
 
         server.createContext("/stitch", new StitchHandler(videos));
         server.createContext("/play",   new PlayerPageHandler());
+        server.createContext("/vlm/latest", new VlmLatestHandler());
 
         server.setExecutor(Executors.newFixedThreadPool(4));
         server.start();
 
         System.out.println("Server started  ->  http://localhost:" + port + "/play");
+        System.out.println("VLM analyze URL -> " + VlmBridge.endpoint()
+                + "  (set VLM_URL, default http://127.0.0.1:8000/analyze)");
         System.out.println("Feeds: left=" + leftVideo + " front=" + frontVideo
                 + " right=" + rightVideo + " rear=" + backVideo);
     }
@@ -161,7 +170,9 @@ public class VideoStreamingServer {
             }
 
             Mat panorama = featherStitch(ready, horizons);
-            writeFrame(out, encodeJpeg(panorama));
+            byte[] jpeg = encodeJpeg(panorama);
+            VlmBridge.offer(jpeg);
+            writeFrame(out, jpeg);
             panorama.release();
           }
         }
@@ -195,6 +206,10 @@ public class VideoStreamingServer {
                 + "  border: 1px solid #2a2a3a; border-radius: 8px; overflow: hidden;"
                 + "  display: flex; align-items: center; justify-content: center; }"
                 + ".pano-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; }"
+                + ".vlm-bar { flex-shrink: 0; width: 100%; max-height: 28%; overflow: auto;"
+                + "  background: #14141c; border: 1px solid #2a2a3a; border-radius: 8px;"
+                + "  padding: 10px 14px; font-size: 0.85rem; color: #c8d4dc; }"
+                + ".vlm-bar strong { color: #7ec8e3; font-weight: 500; }"
                 + "</style>"
                 + "</head><body>"
                 + "<div class='container'>"
@@ -202,7 +217,23 @@ public class VideoStreamingServer {
                 + "  <div class='pano-wrap'>"
                 + "    <img src='/stitch' alt='360° stitched panorama'>"
                 + "  </div>"
+                + "  <div class='vlm-bar' id='vlm'>VLM: waiting for Python service on :8000</div>"
                 + "</div>"
+                + "<script>"
+                + "async function poll(){"
+                + "  try{const r=await fetch('/vlm/latest');const j=await r.json();"
+                + "    const d=j.description||j.scene||'';"
+                + "    const v=(j.vehicles||[]).join(', ')||'none';"
+                + "    const p=(j.people||[]).join(', ')||'none';"
+                + "    document.getElementById('vlm').innerHTML="
+                + "      '<strong>Scene</strong> '+ (j.scene||'?')"
+                + "      +' &nbsp;|&nbsp; <strong>Vehicles</strong> '+v"
+                + "      +' &nbsp;|&nbsp; <strong>People</strong> '+p"
+                + "      +'<br>'+(d||'');"
+                + "  }catch(e){}"
+                + "}"
+                + "poll(); setInterval(poll,1000);"
+                + "</script>"
                 + "</body></html>";
 
             byte[] bytes = html.getBytes("UTF-8");
@@ -1015,5 +1046,106 @@ public class VideoStreamingServer {
         out.write(jpeg);
         out.write("\r\n".getBytes("UTF-8"));
         out.flush();
+    }
+
+    /**
+     * Optional Python VLM on VLM_URL (default http://127.0.0.1:8000/analyze).
+     * Posts at ~1 Hz so the 8 GB Orin is not flooded.
+     */
+    static final class VlmBridge {
+        private static final AtomicReference<String> LATEST =
+                new AtomicReference<>("{\"scene\":\"waiting\",\"vehicles\":[],\"people\":[],"
+                        + "\"hazards\":[],\"description\":\"VLM service not queried yet\","
+                        + "\"confidence\":0}");
+        private static final AtomicLong LAST_MS = new AtomicLong(0);
+        private static final java.util.concurrent.ExecutorService POST =
+                Executors.newSingleThreadExecutor();
+
+        static String endpoint() {
+            String url = System.getenv("VLM_URL");
+            if (url == null || url.trim().isEmpty()) {
+                return "http://127.0.0.1:8000/analyze";
+            }
+            return url.trim();
+        }
+
+        static String latestJson() {
+            return LATEST.get();
+        }
+
+        static void offer(final byte[] jpeg) {
+            if (jpeg == null || jpeg.length < 32) {
+                return;
+            }
+            long now = System.currentTimeMillis();
+            long prev = LAST_MS.get();
+            if (now - prev < 1000) {
+                return;
+            }
+            if (!LAST_MS.compareAndSet(prev, now)) {
+                return;
+            }
+            POST.execute(new Runnable() {
+                @Override public void run() {
+                    postJpeg(jpeg);
+                }
+            });
+        }
+
+        static void postJpeg(byte[] jpeg) {
+            String boundary = "----vlm" + System.currentTimeMillis();
+            try {
+                URL url = new URL(endpoint());
+                HttpURLConnection c = (HttpURLConnection) url.openConnection();
+                c.setConnectTimeout(400);
+                c.setReadTimeout(8000);
+                c.setDoOutput(true);
+                c.setRequestMethod("POST");
+                c.setRequestProperty("Content-Type",
+                        "multipart/form-data; boundary=" + boundary);
+                byte[] head = ("--" + boundary + "\r\n"
+                        + "Content-Disposition: form-data; name=\"file\"; filename=\"frame.jpg\"\r\n"
+                        + "Content-Type: image/jpeg\r\n\r\n").getBytes(StandardCharsets.UTF_8);
+                byte[] tail = ("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8);
+                c.setFixedLengthStreamingMode(head.length + jpeg.length + tail.length);
+                OutputStream os = c.getOutputStream();
+                os.write(head);
+                os.write(jpeg);
+                os.write(tail);
+                os.flush();
+                int code = c.getResponseCode();
+                InputStream in = (code >= 200 && code < 300) ? c.getInputStream() : c.getErrorStream();
+                if (in != null) {
+                    byte[] buf = readAll(in);
+                    if (code >= 200 && code < 300 && buf.length > 0) {
+                        LATEST.set(new String(buf, StandardCharsets.UTF_8));
+                    }
+                    in.close();
+                }
+                c.disconnect();
+            } catch (Exception ignored) {
+                // Python service is optional.
+            }
+        }
+
+        static byte[] readAll(InputStream in) throws IOException {
+            byte[] buf = new byte[4096];
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            int n;
+            while ((n = in.read(buf)) >= 0) {
+                out.write(buf, 0, n);
+            }
+            return out.toByteArray();
+        }
+    }
+
+    static final class VlmLatestHandler implements HttpHandler {
+        @Override public void handle(HttpExchange ex) throws IOException {
+            byte[] bytes = VlmBridge.latestJson().getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+            ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+            ex.sendResponseHeaders(200, bytes.length);
+            try (OutputStream os = ex.getResponseBody()) { os.write(bytes); }
+        }
     }
 }

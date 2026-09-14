@@ -1,0 +1,2 @@
+{"image": "frame_00123.jpg", "question": "What vehicles are visible?", "answer": "{\"vehicles\": [\"delivery_truck\", \"pickup_truck\", \"car\"], \"people\": [], \"hazards\": [], \"scene\": \"residential road\", \"description\": \"A delivery truck, pickup, and car are along the street.\", \"confidence\": 0.9}"}
+{"image": "frame_00124.jpg", "question": "Is there a pedestrian?", "answer": "{\"vehicles\": [\"car\"], \"people\": [], \"hazards\": [], \"scene\": \"residential road\", \"description\": \"No pedestrian is visible.\", \"confidence\": 0.8}"}
